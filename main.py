@@ -1,530 +1,581 @@
-import numpy as np
+"""Universal ticker-driven SEC companyfacts extraction pipeline."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+import shutil
+from typing import Any, Iterable, Mapping
+
 import pandas as pd
 import requests
 
-# Shared Configuration
-HEADERS = {"User-Agent": "Bhavika Gupta bhavika.gupta@r9wealth.com"}
+from config import CONFIG, PipelineConfig
+from metric_aliases import BALANCE_SHEET_METRICS, LTM_METRICS, METRIC_ALIASES
 
-# ==============================================================================
-# 1. CORE TICKER DIRECTORY LOADER
-# ==============================================================================
 
-def load_sec_ticker_directory():
-    """Fetches the official SEC ticker-to-CIK directory and pads CIKs to 10 digits."""
-    url = "https://www.sec.gov/files/company_tickers.json"
-    response = requests.get(url, headers=HEADERS)
+SEC_TICKER_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_COMPANYFACTS_URL = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
+MILLIONS = 1_000_000
 
-    if response.status_code == 200:
-        ticker_data = response.json()
-        df_tickers = pd.DataFrame.from_dict(ticker_data, orient="index")
-        df_tickers["cik_str"] = df_tickers["cik_str"].astype(str).str.zfill(10)
-        print("✅ SEC Ticker Directory successfully loaded!")
-        return df_tickers
-    else:
-        print(f"❌ Failed to fetch ticker data. Status Code: {response.status_code}.")
-        return None
+BASE_ANNUAL = "Base Annual Value"
+CURRENT_YTD = "Current YTD Value"
+PRIOR_YTD = "Prior Year YTD Value"
+FINAL_LTM = "Final LTM Value"
+LTM_COMPONENT_COLUMNS = (BASE_ANNUAL, CURRENT_YTD, PRIOR_YTD, FINAL_LTM)
 
-# ==============================================================================
-# 2. PORTFOLIO PERFORMANCE MATRIX (REVENUE & NET INCOME WITH QUARTER DETAILS)
-# ==============================================================================
 
-TAG_MAPPINGS = {
-    "Revenue": ["RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet", "Revenues"],
-    # Added common fallback tags used when companies report net losses or have non-controlling interests
-    "Net_Profit": ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"]
-}
+@dataclass
+class PipelineResult:
+    """All reusable outputs produced by one pipeline run."""
 
-def fetch_clean_sec_df(company_facts, metric_name):
-    """Fetches all entries for a metric and adds columns to compute exact day durations."""
-    us_gaap_data = company_facts.get("facts", {}).get("us-gaap", {})
-    combined_dfs = []
+    ltm_metrics: pd.DataFrame
+    balance_sheet: pd.DataFrame
+    output_path: Path | None = None
+    errors: dict[str, str] = field(default_factory=dict)
 
-    for tag in TAG_MAPPINGS[metric_name]:
-        if tag in us_gaap_data:
-            units = us_gaap_data[tag].get("units", {})
-            for unit_key in units.keys():
-                df = pd.DataFrame(units[unit_key])
-                if not df.empty and 'form' in df.columns:
-                    combined_dfs.append(df)
 
-    if not combined_dfs:
+def _request_headers(config: PipelineConfig) -> dict[str, str]:
+    return {"User-Agent": config.sec_user_agent, "Accept-Encoding": "gzip, deflate"}
+
+
+def load_sec_ticker_directory(
+    config: PipelineConfig = CONFIG,
+    session: Any = requests,
+) -> pd.DataFrame:
+    """Fetch the official SEC ticker-to-CIK directory and normalize its keys."""
+    response = session.get(
+        SEC_TICKER_URL,
+        headers=_request_headers(config),
+        timeout=config.request_timeout_seconds,
+    )
+    response.raise_for_status()
+    directory = pd.DataFrame.from_dict(response.json(), orient="index")
+    directory["ticker"] = directory["ticker"].str.upper().str.strip()
+    directory["cik_str"] = directory["cik_str"].astype(str).str.zfill(10)
+    return directory
+
+
+def resolve_cik(ticker: str, ticker_directory: pd.DataFrame) -> str:
+    """Resolve one ticker without performing another SEC request."""
+    normalized_ticker = ticker.upper().strip()
+    match = ticker_directory[ticker_directory["ticker"] == normalized_ticker]
+    if match.empty:
+        raise ValueError(f"Ticker {normalized_ticker!r} was not found in the SEC directory.")
+    return str(match.iloc[0]["cik_str"]).zfill(10)
+
+
+def fetch_company_facts(
+    ticker: str | None = None,
+    cik: str | None = None,
+    config: PipelineConfig = CONFIG,
+    ticker_directory: pd.DataFrame | None = None,
+    session: Any = requests,
+) -> Mapping[str, Any]:
+    """Fetch SEC companyfacts by CIK, resolving a supplied ticker when necessary."""
+    if cik is None:
+        if ticker is None:
+            raise ValueError("Either ticker or cik is required.")
+        directory = ticker_directory
+        if directory is None:
+            directory = load_sec_ticker_directory(config=config, session=session)
+        cik = resolve_cik(ticker, directory)
+
+    normalized_cik = str(cik).zfill(10)
+    response = session.get(
+        SEC_COMPANYFACTS_URL.format(cik=normalized_cik),
+        headers=_request_headers(config),
+        timeout=config.request_timeout_seconds,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def _available_unit_items(units: Mapping[str, Any]) -> Iterable[tuple[str, Any]]:
+    """Yield monetary USD facts and ignore share/count units."""
+    if "USD" in units:
+        yield "USD", units["USD"]
+
+
+def _collect_metric_entries(
+    company_facts: Mapping[str, Any],
+    metric_name: str,
+    *,
+    require_duration: bool,
+    aliases: Mapping[str, tuple[str, ...]] = METRIC_ALIASES,
+) -> pd.DataFrame:
+    if metric_name not in aliases:
+        raise KeyError(f"Unknown metric {metric_name!r}.")
+
+    us_gaap = company_facts.get("facts", {}).get("us-gaap", {})
+    rows: list[dict[str, Any]] = []
+
+    for priority, tag in enumerate(aliases[metric_name]):
+        details = us_gaap.get(tag)
+        if not details:
+            continue
+        for unit_name, unit_data in _available_unit_items(details.get("units", {})):
+            for entry in unit_data:
+                has_duration = "start" in entry and "end" in entry
+                if require_duration != has_duration:
+                    continue
+                if entry.get("form") not in {"10-K", "10-Q"}:
+                    continue
+                rows.append(
+                    {
+                        **entry,
+                        "tag": tag,
+                        "metric": metric_name,
+                        "unit": unit_name,
+                        "tag_priority": priority,
+                    }
+                )
+
+    if not rows:
         return pd.DataFrame()
 
-    total_df = pd.concat(combined_dfs, ignore_index=True)
-    total_df = total_df[total_df['form'].isin(['10-K', '10-Q'])].copy()
+    frame = pd.DataFrame(rows)
+    frame["end"] = pd.to_datetime(frame["end"], errors="coerce")
+    frame["filed"] = pd.to_datetime(frame.get("filed"), errors="coerce")
+    if require_duration:
+        frame["start"] = pd.to_datetime(frame["start"], errors="coerce")
+        frame["days"] = (frame["end"] - frame["start"]).dt.days
+    return frame.dropna(subset=["end", "val"])
 
-    if 'start' in total_df.columns and 'end' in total_df.columns:
-        total_df['start'] = pd.to_datetime(total_df['start'])
-        total_df['end'] = pd.to_datetime(total_df['end'])
-        total_df['days'] = (total_df['end'] - total_df['start']).dt.days
+
+def fetch_clean_sec_df(
+    company_facts: Mapping[str, Any],
+    metric_name: str,
+    aliases: Mapping[str, tuple[str, ...]] = METRIC_ALIASES,
+) -> pd.DataFrame:
+    """Return normalized 10-K/10-Q duration facts for a named metric."""
+    return _collect_metric_entries(
+        company_facts,
+        metric_name,
+        require_duration=True,
+        aliases=aliases,
+    )
+
+
+def _best_fact(frame: pd.DataFrame) -> pd.Series | None:
+    if frame.empty:
+        return None
+    sort_columns = [column for column in ("tag_priority", "filed", "end") if column in frame]
+    ascending = [True if column == "tag_priority" else False for column in sort_columns]
+    return frame.sort_values(sort_columns, ascending=ascending, na_position="last").iloc[0]
+
+
+def _latest_period_fact(frame: pd.DataFrame) -> pd.Series | None:
+    if frame.empty:
+        return None
+    latest_end = frame["end"].max()
+    return _best_fact(frame[frame["end"] == latest_end])
+
+
+def _annual_facts(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame[
+        (frame["form"] == "10-K") & frame["days"].between(330, 380, inclusive="both")
+    ].copy()
+
+
+def _annual_fact_for_year(frame: pd.DataFrame, year: int) -> pd.Series | None:
+    if frame.empty:
+        return None
+    if "fy" in frame:
+        fiscal_year = pd.to_numeric(frame["fy"], errors="coerce")
+        match = frame[fiscal_year == year]
     else:
-        total_df['end'] = pd.to_datetime(total_df['end'])
-        total_df['days'] = 0
+        match = frame.iloc[0:0]
+    if match.empty:
+        match = frame[frame["end"].dt.year == year]
+    return _latest_period_fact(match)
 
-    return total_df
 
-def get_income_statement_series(facts, metric_name, target_years):
-    """Extracts precise values for annual years, individual components, and calculates LTM."""
-    df = fetch_clean_sec_df(facts, metric_name)
-    results = {f"FY{yr}": 0.0 for yr in target_years}
+def _to_millions(fact: pd.Series | None) -> float:
+    return 0.0 if fact is None else float(fact["val"]) / MILLIONS
 
-    # Initialize component placeholders for the user to view the breakdown calculation
-    results["Base_Annual_Val"] = 0.0
-    results["Current_YTD_Val"] = 0.0
-    results["Prior_YTD_Val"] = 0.0
-    results["LTM"] = 0.0
 
-    if df.empty:
-        return results
+def get_income_statement_series(
+    facts: Mapping[str, Any],
+    metric_name: str,
+    target_years: Iterable[int],
+    aliases: Mapping[str, tuple[str, ...]] = METRIC_ALIASES,
+) -> dict[str, float]:
+    """Extract fiscal years and an auditable LTM bridge for any duration metric.
 
-    # --- Annual Processing ---
-    df_annual = df[(df["form"] == "10-K") & (df["days"] > 330) & (df["days"] < 380)]
-    for yr in target_years:
-        match = df_annual[df_annual["fy"] == yr]
-        if not match.empty:
-            results[f"FY{yr}"] = match.sort_values(by="end").iloc[-1]["val"] / 1e6
+    LTM = latest annual FY + current YTD - prior-year YTD.
+    """
+    years = tuple(int(year) for year in target_years)
+    results: dict[str, float] = {f"FY{year}": 0.0 for year in years}
+    results.update({column: 0.0 for column in LTM_COMPONENT_COLUMNS})
 
-    # --- LTM Processing with Explicit Components Exposed ---
-    max_fy_in_10k = df_annual["fy"].max() if not df_annual.empty else 0
-    df_quarterly = df[df["form"] == "10-Q"].sort_values(by="end")
+    frame = fetch_clean_sec_df(facts, metric_name, aliases=aliases)
+    if frame.empty:
+        return _with_legacy_component_keys(results)
 
-    if df_quarterly.empty:
-        val = results[f"FY{max_fy_in_10k}"] if max_fy_in_10k in target_years else 0.0
-        results["LTM"] = val
-        results["Base_Annual_Val"] = val
-        return results
+    annual = _annual_facts(frame)
+    for year in years:
+        results[f"FY{year}"] = _to_millions(_annual_fact_for_year(annual, year))
 
-    latest_10q = df_quarterly.iloc[-1]
-    latest_10q_fy = latest_10q["fy"]
-    latest_10q_fp = latest_10q["fp"]
+    base_fact = _latest_period_fact(annual)
+    base_value = _to_millions(base_fact)
+    results[BASE_ANNUAL] = base_value
 
-    if latest_10q_fy <= max_fy_in_10k:
-        val = results[f"FY{max_fy_in_10k}"] if max_fy_in_10k in target_years else 0.0
-        results["LTM"] = val
-        results["Base_Annual_Val"] = val
-        return results
+    quarterly = frame[
+        (frame["form"] == "10-Q") & frame["days"].between(70, 300, inclusive="both")
+    ].copy()
+    if base_fact is None or quarterly.empty:
+        results[FINAL_LTM] = base_value
+        return _with_legacy_component_keys(results)
 
-    base_annual_val = df_annual[df_annual["fy"] == max_fy_in_10k].sort_values(by="end").iloc[-1]["val"] / 1e6 if not df_annual[df_annual["fy"] == max_fy_in_10k].empty else 0.0
-    curr_ytd_match = df_quarterly[(df_quarterly["fy"] == latest_10q_fy) & (df_quarterly["fp"] == latest_10q_fp)]
-    curr_ytd_val = curr_ytd_match.iloc[-1]["val"] / 1e6 if not curr_ytd_match.empty else 0.0
-    prior_ytd_match = df_quarterly[(df_quarterly["fy"] == max_fy_in_10k) & (df_quarterly["fp"] == latest_10q_fp)]
-    prior_ytd_val = prior_ytd_match.iloc[-1]["val"] / 1e6 if not prior_ytd_match.empty else 0.0
+    latest_quarter_end = quarterly["end"].max()
+    if latest_quarter_end <= base_fact["end"]:
+        results[FINAL_LTM] = base_value
+        return _with_legacy_component_keys(results)
 
-    results["Base_Annual_Val"] = base_annual_val
-    results["Current_YTD_Val"] = curr_ytd_val
-    results["Prior_YTD_Val"] = prior_ytd_val
-    results["LTM"] = base_annual_val + curr_ytd_val - prior_ytd_val
+    current_candidates = quarterly[quarterly["end"] == latest_quarter_end]
+    longest_current_duration = current_candidates["days"].max()
+    current_candidates = current_candidates[
+        current_candidates["days"].between(
+            longest_current_duration - 5,
+            longest_current_duration + 5,
+            inclusive="both",
+        )
+    ]
+    current_fact = _best_fact(current_candidates)
+
+    prior_target_end = latest_quarter_end - pd.DateOffset(years=1)
+    prior_candidates = quarterly[
+        quarterly["end"].between(
+            prior_target_end - pd.Timedelta(days=20),
+            prior_target_end + pd.Timedelta(days=20),
+            inclusive="both",
+        )
+        & quarterly["days"].between(
+            longest_current_duration - 7,
+            longest_current_duration + 7,
+            inclusive="both",
+        )
+    ]
+    if current_fact is not None and "fp" in prior_candidates:
+        same_period = prior_candidates[prior_candidates["fp"] == current_fact.get("fp")]
+        if not same_period.empty:
+            prior_candidates = same_period
+    prior_fact = _best_fact(prior_candidates)
+
+    current_value = _to_millions(current_fact)
+    prior_value = _to_millions(prior_fact)
+    results[CURRENT_YTD] = current_value
+    results[PRIOR_YTD] = prior_value
+    results[FINAL_LTM] = base_value + current_value - prior_value
+    return _with_legacy_component_keys(results)
+
+
+def _with_legacy_component_keys(results: dict[str, float]) -> dict[str, float]:
+    """Keep existing callers working while exposing clearer output labels."""
+    results["Base_Annual_Val"] = results[BASE_ANNUAL]
+    results["Current_YTD_Val"] = results[CURRENT_YTD]
+    results["Prior_YTD_Val"] = results[PRIOR_YTD]
+    results["LTM"] = results[FINAL_LTM]
     return results
 
-def extract_audited_sec_matrix(tickers_list, df_tickers_source, target_years=[2024, 2025]):
-    """Generates the clean data table exposing the formula steps for calculating LTM figures."""
-    matrix_rows = []
 
-    for ticker in tickers_list:
-        ticker = ticker.upper().strip()
-        print(f"💼 Auditing income statement for: {ticker}...")
+def extract_ltm_metrics(
+    facts: Mapping[str, Any],
+    ticker: str,
+    cik: str,
+    target_years: Iterable[int],
+    metrics: Iterable[str] = LTM_METRICS,
+) -> pd.DataFrame:
+    """Build one row per LTM metric with every formula component exposed."""
+    years = tuple(int(year) for year in target_years)
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        values = get_income_statement_series(facts, metric, years)
+        row: dict[str, Any] = {"Ticker": ticker, "CIK": cik, "Metric": metric}
+        row.update({f"FY{year}": round(values[f"FY{year}"], 2) for year in years})
+        row.update({column: round(values[column], 2) for column in LTM_COMPONENT_COLUMNS})
+        row["LTM Formula"] = "Latest Annual FY + Current YTD - Prior Year YTD"
+        rows.append(row)
+    return pd.DataFrame(rows)
 
-        row = df_tickers_source[df_tickers_source["ticker"] == ticker]
-        if row.empty:
+
+def extract_audited_sec_matrix(
+    tickers_list: Iterable[str],
+    df_tickers_source: pd.DataFrame,
+    target_years: Iterable[int],
+    config: PipelineConfig = CONFIG,
+    session: Any = requests,
+) -> pd.DataFrame:
+    """Backward-compatible wide Revenue/Net Income matrix for multiple tickers."""
+    rows: list[dict[str, Any]] = []
+    years = tuple(int(year) for year in target_years)
+    for ticker_value in tickers_list:
+        ticker = ticker_value.upper().strip()
+        cik = resolve_cik(ticker, df_tickers_source)
+        facts = fetch_company_facts(
+            ticker=ticker,
+            cik=cik,
+            config=config,
+            ticker_directory=df_tickers_source,
+            session=session,
+        )
+        row: dict[str, Any] = {"Company/Ticker": ticker}
+        for metric, label in (("Revenue", "Revenue"), ("Net Income", "Net Profit")):
+            values = get_income_statement_series(facts, metric, years)
+            for year in years:
+                row[f"{label} (FY{year})"] = round(values[f"FY{year}"], 2)
+            row[f"{label} (Base FY)"] = round(values[BASE_ANNUAL], 2)
+            row[f"{label} (Current YTD)"] = round(values[CURRENT_YTD], 2)
+            row[f"{label} (Prior YTD)"] = round(values[PRIOR_YTD], 2)
+            row[f"{label} (LTM)"] = round(values[FINAL_LTM], 2)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("Company/Ticker")
+
+
+def extract_balance_sheet_metrics(
+    facts: Mapping[str, Any],
+    ticker: str,
+    cik: str,
+    metrics: Iterable[str] = BALANCE_SHEET_METRICS,
+) -> pd.DataFrame:
+    """Return latest reported point-in-time facts for reusable balance metrics."""
+    rows: list[dict[str, Any]] = []
+    for metric in metrics:
+        frame = _collect_metric_entries(facts, metric, require_duration=False)
+        if frame.empty:
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "CIK": cik,
+                    "Metric": metric,
+                    "Original SEC Tag": None,
+                    "As Of Date": None,
+                    "Form": None,
+                    "Value ($ Millions)": 0.0,
+                }
+            )
             continue
-        cik = row.iloc[0]["cik_str"]
 
-        url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-        res = requests.get(url, headers=HEADERS)
-        if res.status_code != 200:
-            continue
-        facts = res.json()
+        latest_end = frame["end"].max()
+        latest = frame[frame["end"] == latest_end]
+        for _, fact in (
+            latest.sort_values(["tag_priority", "filed"], ascending=[True, False])
+            .drop_duplicates("tag", keep="first")
+            .iterrows()
+        ):
+            rows.append(
+                {
+                    "Ticker": ticker,
+                    "CIK": cik,
+                    "Metric": metric,
+                    "Original SEC Tag": fact["tag"],
+                    "As Of Date": latest_end.date().isoformat(),
+                    "Form": fact["form"],
+                    "Value ($ Millions)": round(float(fact["val"]) / MILLIONS, 2),
+                }
+            )
+    return pd.DataFrame(rows)
 
-        company_row = {"Company/Ticker": ticker}
-        rev_data = get_income_statement_series(facts, "Revenue", target_years)
-        net_data = get_income_statement_series(facts, "Net_Profit", target_years)
 
-        for yr in target_years:
-            company_row[f"Revenue (FY{yr})"] = round(rev_data[f"FY{yr}"], 2)
-        company_row["Revenue (Base FY)"] = round(rev_data["Base_Annual_Val"], 2)
-        company_row["Revenue (Current YTD)"] = round(rev_data["Current_YTD_Val"], 2)
-        company_row["Revenue (Prior YTD)"] = round(rev_data["Prior_YTD_Val"], 2)
-        company_row["Revenue (LTM)"] = round(rev_data["LTM"], 2)
+def _resolve_facts(
+    ticker: str,
+    cik: str | None,
+    facts: Mapping[str, Any] | None,
+    config: PipelineConfig,
+    ticker_directory: pd.DataFrame | None,
+    session: Any,
+) -> tuple[str, Mapping[str, Any]]:
+    if cik is None:
+        directory = ticker_directory
+        if directory is None:
+            directory = load_sec_ticker_directory(config=config, session=session)
+        cik = resolve_cik(ticker, directory)
+    normalized_cik = str(cik).zfill(10)
+    if facts is None:
+        facts = fetch_company_facts(
+            ticker=ticker,
+            cik=normalized_cik,
+            config=config,
+            ticker_directory=ticker_directory,
+            session=session,
+        )
+    return normalized_cik, facts
 
-        for yr in target_years:
-            company_row[f"Net Profit (FY{yr})"] = round(net_data[f"FY{yr}"], 2)
-        company_row["Net Profit (Base FY)"] = round(net_data["Base_Annual_Val"], 2)
-        company_row["Net Profit (Current YTD)"] = round(net_data["Current_YTD_Val"], 2)
-        company_row["Net Profit (Prior YTD)"] = round(net_data["Prior_YTD_Val"], 2)
-        company_row["Net Profit (LTM)"] = round(net_data["LTM"], 2)
 
-        matrix_rows.append(company_row)
+def get_lean_filtered_balance_sheet(
+    ticker: str,
+    cik: str | None = None,
+    target_years: Iterable[int] | None = None,
+    config: PipelineConfig = CONFIG,
+    facts: Mapping[str, Any] | None = None,
+    ticker_directory: pd.DataFrame | None = None,
+    session: Any = requests,
+) -> pd.DataFrame:
+    """Compatibility wrapper for the latest cash, investments, debt, and preferred equity."""
+    del target_years  # Point-in-time facts do not have an LTM or duration.
+    normalized_ticker = ticker.upper().strip()
+    resolved_cik, resolved_facts = _resolve_facts(
+        normalized_ticker, cik, facts, config, ticker_directory, session
+    )
+    return extract_balance_sheet_metrics(resolved_facts, normalized_ticker, resolved_cik)
 
-    return pd.DataFrame(matrix_rows).set_index("Company/Ticker")
 
-# ==============================================================================
-# 3. LEAN BALANCE SHEET EXTRACTOR (CORE DEBT, LIQUIDITY & PREFERRED EQUITY)
-# ==============================================================================
+def _ltm_subset_wrapper(
+    ticker: str,
+    metrics: Iterable[str],
+    cik: str | None,
+    target_years: Iterable[int] | None,
+    config: PipelineConfig,
+    facts: Mapping[str, Any] | None,
+    ticker_directory: pd.DataFrame | None,
+    session: Any,
+) -> pd.DataFrame:
+    normalized_ticker = ticker.upper().strip()
+    resolved_cik, resolved_facts = _resolve_facts(
+        normalized_ticker, cik, facts, config, ticker_directory, session
+    )
+    years = config.target_years if target_years is None else tuple(target_years)
+    return extract_ltm_metrics(
+        resolved_facts,
+        normalized_ticker,
+        resolved_cik,
+        years,
+        metrics=metrics,
+    )
 
-def get_lean_filtered_balance_sheet(ticker):
-    """Fetches liquid assets, core debt, and preferred equity parameters from the balance sheet."""
-    ticker = ticker.upper().strip()
-    print(f"📡 Locating SEC data and applying lean filters for {ticker}...")
 
-    tickers_url = "https://www.sec.gov/files/company_tickers.json"
-    try:
-        ticker_data = requests.get(tickers_url, headers=HEADERS).json()
-        cik = next((str(v['cik_str']).zfill(10) for v in ticker_data.values() if v['ticker'] == ticker), None)
-    except Exception:
-        print("❌ Failed to reach SEC ticker directory.")
-        return None
+def get_dna_and_impairment_ltm_ready(
+    ticker: str,
+    cik: str | None = None,
+    target_years: Iterable[int] | None = None,
+    config: PipelineConfig = CONFIG,
+    facts: Mapping[str, Any] | None = None,
+    ticker_directory: pd.DataFrame | None = None,
+    session: Any = requests,
+) -> pd.DataFrame:
+    """Return auditable D&A and impairment FY/LTM rows."""
+    return _ltm_subset_wrapper(
+        ticker,
+        ("D&A", "Impairment"),
+        cik,
+        target_years,
+        config,
+        facts,
+        ticker_directory,
+        session,
+    )
 
-    if not cik:
-        print(f"❌ Ticker {ticker} not found.")
-        return None
 
-    facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    facts_res = requests.get(facts_url, headers=HEADERS)
-    if facts_res.status_code != 200:
-        print(f"❌ Failed to fetch financial facts for {ticker}.")
-        return None
+def get_earnings_and_interest_ltm_ready(
+    ticker: str,
+    cik: str | None = None,
+    target_years: Iterable[int] | None = None,
+    config: PipelineConfig = CONFIG,
+    facts: Mapping[str, Any] | None = None,
+    ticker_directory: pd.DataFrame | None = None,
+    session: Any = requests,
+) -> pd.DataFrame:
+    """Return auditable EBIT, EBT, and interest FY/LTM rows."""
+    return _ltm_subset_wrapper(
+        ticker,
+        ("EBIT", "EBT", "Interest Expense", "Interest Income"),
+        cik,
+        target_years,
+        config,
+        facts,
+        ticker_directory,
+        session,
+    )
 
-    us_gaap = facts_res.json().get("facts", {}).get("us-gaap", {})
 
-    # Explicit Whitelist including Preferred Equity structural tags
-    allowed_liquid_assets = [
-        "CashAndCashEquivalentsAtCarryingValue", "Cash", "ShortTermInvestments",
-        "AvailableForSaleSecuritiesCurrent", "MarketableSecuritiesCurrent",
-        "PreferredStockValue", "PreferredStockCarryingValue", "TemporaryEquityCarryingAmountAttributableToParent"
-    ]
+def _derived_output_path(template_path: Path) -> Path:
+    suffix = template_path.suffix if template_path.suffix.lower() == ".xlsx" else ".xlsx"
+    return template_path.with_name(f"{template_path.stem}_SEC_output{suffix}")
 
-    # Adjusted blocklist to bypass keyword matches if the tag contains structural preferred labels
-    keyword_blocklist = [
-        "asset", "receivable", "inventory", "property", "plant", "equipment",
-        "goodwill", "intangible", "prepaid", "advance", "rightofuse", "capitalized",
-        "investments", "accountspayable", "sharebasedcompensation", "comprehensive",
-        "retainedearnings", "total", "tax", "employee", "pension", "postretirement",
-        "benefit", "dividend", "stock", "equity", "paidincapital"
-    ]
 
-    exact_total_tags = [
-        "liabilities", "liabilitiescurrent", "liabilitiesnoncurrent",
-        "stockholdersequity", "partnersequity", "liabilitiesandstockholdersequity",
-        "liabilitiesandpartnersequity"
-    ]
+def write_results_to_excel(
+    ltm_metrics: pd.DataFrame,
+    balance_sheet: pd.DataFrame,
+    config: PipelineConfig,
+) -> Path:
+    """Preserve the template and write results to a derived output workbook."""
+    template_path = config.excel_template_path.expanduser().resolve()
+    output_path = _derived_output_path(template_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    standard_keys = {'end', 'val', 'accn', 'fy', 'fp', 'form', 'filed', 'frame'}
-    rows = []
-
-    for tag, details in us_gaap.items():
-        tag_lower = tag.lower()
-        is_whitelisted = tag in allowed_liquid_assets
-
-        # Ensure preferred stock variations aren't accidentally trapped by 'stock' or 'equity' filters
-        is_preferred_exception = "preferredstock" in tag_lower
-
-        is_keyword_blocked = any(keyword in tag_lower for keyword in keyword_blocklist) and not is_preferred_exception
-        is_exact_blocked = tag_lower in exact_total_tags
-
-        if is_whitelisted or (not is_keyword_blocked and not is_exact_blocked):
-            for unit_name, unit_data in details.get("units", {}).items():
-                for entry in unit_data:
-                    if 'start' not in entry and entry.get('form') in ['10-Q', '10-K']:
-                        if set(entry.keys()).issubset(standard_keys):
-                            rows.append({
-                                "Original SEC Tag": tag,
-                                "Value": entry["val"],
-                                "Date": entry["end"],
-                                "Form": entry["form"]
-                            })
-
-    if not rows:
-        print(f"❌ No valid filtered data found for {ticker}.")
-        return None
-
-    df = pd.DataFrame(rows)
-    df['Date'] = pd.to_datetime(df['Date'])
-    latest_date = df['Date'].max()
-    df_latest = df[df['Date'] == latest_date].copy()
-    df_latest = df_latest.drop_duplicates(subset=['Original SEC Tag'], keep='last')
-
-    df_latest['Value ($ Millions)'] = (df_latest['Value'] / 1e6).round(2)
-    df_final = df_latest[['Original SEC Tag', 'Value ($ Millions)']].sort_values('Original SEC Tag').reset_index(drop=True)
-
-    print(f"\n========================================================")
-    print(f"🏛️ LEAN BALANCE SHEET (CORE DEBT, LIQUIDITY & PREFERRED): {ticker}")
-    print(f"📅 As of Date: {latest_date.date()} | Form: {df_latest.iloc[0]['Form']}")
-    print(f"========================================================")
-
-    return df_final
-
-# ==============================================================================
-# 4. DEPRECIATION, AMORTIZATION & IMPAIRMENT (LTM-READY)
-# ==============================================================================
-
-def get_dna_and_impairment_ltm_ready(ticker):
-    """Fetches D&A and Impairment metrics for last 2 FYs and current/prior YTD quarters."""
-    ticker = ticker.upper().strip()
-    print(f"📡 Locating LTM-ready D&A and Impairment data for {ticker}...")
-
-    tickers_url = "https://www.sec.gov/files/company_tickers.json"
-    try:
-        ticker_data = requests.get(tickers_url, headers=HEADERS).json()
-        cik = next((str(v['cik_str']).zfill(10) for v in ticker_data.values() if v['ticker'] == ticker), None)
-    except Exception:
-        print("❌ Failed to reach SEC ticker directory.")
-        return None
-
-    if not cik:
-        print(f"❌ Ticker {ticker} not found.")
-        return None
-
-    facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    facts_res = requests.get(facts_url, headers=HEADERS)
-    if facts_res.status_code != 200:
-        print(f"❌ Failed to fetch financial facts for {ticker}.")
-        return None
-
-    us_gaap = facts_res.json().get("facts", {}).get("us-gaap", {})
-
-    target_tags = [
-        "DepreciationDepletionAndAmortization", "DepreciationAndAmortization", "Depreciation",
-        "AmortizationOfIntangibleAssets", "AssetImpairmentCharges", "GoodwillImpairmentLoss",
-        "ImpairmentOfIntangibleAssetsExcludingGoodwill", "RestructuringAndImpairmentCharges",
-        "PropertyPlantAndEquipmentImpairment"
-    ]
-
-    standard_keys = {'start', 'end', 'val', 'accn', 'fy', 'fp', 'form', 'filed', 'frame'}
-    rows = []
-
-    for tag in target_tags:
-        if tag in us_gaap:
-            for unit_name, unit_data in us_gaap[tag].get("units", {}).items():
-                for entry in unit_data:
-                    if 'start' in entry and 'end' in entry and 'form' in entry:
-                        if set(entry.keys()).issubset(standard_keys):
-                            rows.append({
-                                "tag": tag,
-                                "value": entry["val"],
-                                "start": entry["start"],
-                                "end": entry["end"],
-                                "form": entry["form"]
-                            })
-
-    if not rows:
-        print(f"❌ No valid D&A or Impairment data found for {ticker}.")
-        return None
-
-    df = pd.DataFrame(rows)
-    df['start'] = pd.to_datetime(df['start'])
-    df['end'] = pd.to_datetime(df['end'])
-    df['duration_days'] = (df['end'] - df['start']).dt.days
-
-    target_records = []
-    column_metadata = {}
-
-    df_annual = df[(df['form'] == '10-K') & (df['duration_days'].between(360, 375))].copy()
-    if not df_annual.empty:
-        annual_dates = sorted(df_annual['end'].unique(), reverse=True)[:2]
-        for d in annual_dates:
-            temp = df_annual[df_annual['end'] == d].drop_duplicates('tag', keep='last')
-            target_records.append(temp)
-            column_metadata[d] = f"FY Ended {d.date()}"
-        latest_fy_date = annual_dates[0]
+    if template_path.exists():
+        shutil.copy2(template_path, output_path)
+        writer_options: dict[str, Any] = {
+            "engine": "openpyxl",
+            "mode": "a",
+            "if_sheet_exists": "replace",
+        }
     else:
-        print("⚠️ No annual 10-K data found.")
-        latest_fy_date = pd.Timestamp.min
+        writer_options = {"engine": "openpyxl", "mode": "w"}
 
-    df_ytd = df[(df['form'] == '10-Q') & (df['end'] > latest_fy_date)].copy()
+    with pd.ExcelWriter(output_path, **writer_options) as writer:
+        ltm_metrics.to_excel(writer, sheet_name="SEC LTM Metrics", index=False)
+        balance_sheet.to_excel(writer, sheet_name="SEC Balance Sheet", index=False)
+    return output_path
 
-    if not df_ytd.empty:
-        latest_ytd_date = df_ytd['end'].max()
-        temp_ytd = df_ytd[df_ytd['end'] == latest_ytd_date]
-        max_ytd_duration = temp_ytd['duration_days'].max()
-        temp_ytd = temp_ytd[temp_ytd['duration_days'] == max_ytd_duration].drop_duplicates('tag', keep='last')
-        target_records.append(temp_ytd)
 
-        months = max(1, round(max_ytd_duration / 30))
-        column_metadata[latest_ytd_date] = f"Latest YTD ({months} Mos) Ended {latest_ytd_date.date()}"
+def run_pipeline(
+    config: PipelineConfig = CONFIG,
+    *,
+    session: Any = requests,
+    write_excel: bool = True,
+) -> PipelineResult:
+    """Run the complete ticker-driven pipeline with one companyfacts fetch per ticker."""
+    ticker_directory = load_sec_ticker_directory(config=config, session=session)
+    ltm_frames: list[pd.DataFrame] = []
+    balance_frames: list[pd.DataFrame] = []
+    errors: dict[str, str] = {}
 
-        prior_ytd_target = latest_ytd_date - pd.Timedelta(days=365)
-        df_prior_ytd = df[
-            (df['form'] == '10-Q') &
-            (df['end'].between(prior_ytd_target - pd.Timedelta(days=15), prior_ytd_target + pd.Timedelta(days=15))) &
-            (df['duration_days'].between(max_ytd_duration - 5, max_ytd_duration + 5))
-        ].copy()
+    for ticker in config.tickers:
+        try:
+            cik = resolve_cik(ticker, ticker_directory)
+            facts = fetch_company_facts(
+                ticker=ticker,
+                cik=cik,
+                config=config,
+                ticker_directory=ticker_directory,
+                session=session,
+            )
+            ltm_frames.append(extract_ltm_metrics(facts, ticker, cik, config.target_years))
+            balance_frames.append(extract_balance_sheet_metrics(facts, ticker, cik))
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            errors[ticker] = str(exc)
 
-        if not df_prior_ytd.empty:
-            prior_ytd_date = df_prior_ytd['end'].max()
-            temp_prior_ytd = df_prior_ytd[df_prior_ytd['end'] == prior_ytd_date].drop_duplicates('tag', keep='last')
-            target_records.append(temp_prior_ytd)
-            column_metadata[prior_ytd_date] = f"Prior YTD ({months} Mos) Ended {prior_ytd_date.date()}"
-        else:
-            print("⚠️ Match for prior year's YTD quarter not found in database.")
+    ltm_metrics = pd.concat(ltm_frames, ignore_index=True) if ltm_frames else pd.DataFrame()
+    balance_sheet = (
+        pd.concat(balance_frames, ignore_index=True) if balance_frames else pd.DataFrame()
+    )
+    output_path = None
+    if write_excel and (not ltm_metrics.empty or not balance_sheet.empty):
+        output_path = write_results_to_excel(ltm_metrics, balance_sheet, config)
 
-    if not target_records:
-        print(f"❌ Could not isolate requested periods for {ticker}.")
-        return None
+    return PipelineResult(
+        ltm_metrics=ltm_metrics,
+        balance_sheet=balance_sheet,
+        output_path=output_path,
+        errors=errors,
+    )
 
-    final_df = pd.concat(target_records)
-    final_df['value_millions'] = (final_df['value'] / 1e6).round(2)
 
-    matrix = final_df.pivot_table(index='tag', columns='end', values='value_millions', aggfunc='last')
-    matrix.columns = [column_metadata[col] for col in matrix.columns]
-    matrix = matrix.fillna(0.00).sort_index()
+def main(config: PipelineConfig = CONFIG) -> PipelineResult:
+    """Single public runner for scripts, notebooks, and scheduled jobs."""
+    result = run_pipeline(config)
+    print(f"Processed {len(config.tickers) - len(result.errors)} of {len(config.tickers)} tickers.")
+    if result.output_path:
+        print(f"Workbook written to: {result.output_path}")
+    for ticker, error in result.errors.items():
+        print(f"{ticker}: {error}")
+    return result
 
-    print(f"\n========================================================")
-    print(f"📉 LTM-READY RECONCILIATION MATRIX: {ticker}")
-    print(f"========================================================")
 
-    return matrix
-
-# ==============================================================================
-# 5. EBIT, EBT & NET INTEREST EXPENSE RECONCILIATION (LTM-READY)
-# ==============================================================================
-
-def get_earnings_and_interest_ltm_ready(ticker):
-    """Fetches EBIT, EBT, Interest Expense, and Income tags to compute Net metrics."""
-    ticker = ticker.upper().strip()
-    print(f"📡 Locating LTM-ready Earnings & Interest data for {ticker}...")
-
-    tickers_url = "https://www.sec.gov/files/company_tickers.json"
-    try:
-        ticker_data = requests.get(tickers_url, headers=HEADERS).json()
-        cik = next((str(v['cik_str']).zfill(10) for v in ticker_data.values() if v['ticker'] == ticker), None)
-    except Exception:
-        print("❌ Failed to reach SEC ticker directory.")
-        return None
-
-    if not cik:
-        print(f"❌ Ticker {ticker} not found.")
-        return None
-
-    facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json"
-    facts_res = requests.get(facts_url, headers=HEADERS)
-    if facts_res.status_code != 200:
-        print(f"❌ Failed to fetch financial facts for {ticker}.")
-        return None
-
-    us_gaap = facts_res.json().get("facts", {}).get("us-gaap", {})
-
-    # Added "InterestExpenseNet" to catch combined net interest lines
-    # Added non-operating variants to catch items filed under "Other Income/Expense"
-    target_tags = [
-        "OperatingIncomeLoss",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
-        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
-        "InterestExpense", "InterestAndDebtExpense", "InterestExpenseNet",
-        "InterestExpenseNonoperating", "InterestIncomeExpenseNonoperatingNet",
-        "InterestIncome", "InvestmentIncomeInterest", "InterestAndDividendIncome"
-    ]
-
-    standard_keys = {'start', 'end', 'val', 'accn', 'fy', 'fp', 'form', 'filed', 'frame'}
-    rows = []
-
-    for tag in target_tags:
-        if tag in us_gaap:
-            for unit_name, unit_data in us_gaap[tag].get("units", {}).items():
-                for entry in unit_data:
-                    if 'start' in entry and 'end' in entry and 'form' in entry:
-                        if set(entry.keys()).issubset(standard_keys):
-                            rows.append({
-                                "tag": tag,
-                                "value": entry["val"],
-                                "start": entry["start"],
-                                "end": entry["end"],
-                                "form": entry["form"]
-                            })
-
-    if not rows:
-        print(f"❌ No valid earnings or interest data found for {ticker}.")
-        return None
-
-    df = pd.DataFrame(rows)
-    df['start'] = pd.to_datetime(df['start'])
-    df['end'] = pd.to_datetime(df['end'])
-    df['duration_days'] = (df['end'] - df['start']).dt.days
-
-    target_records = []
-    column_metadata = {}
-
-    df_annual = df[(df['form'] == '10-K') & (df['duration_days'].between(360, 375))].copy()
-    if not df_annual.empty:
-        annual_dates = sorted(df_annual['end'].unique(), reverse=True)[:2]
-        for d in annual_dates:
-            temp = df_annual[df_annual['end'] == d].drop_duplicates('tag', keep='last')
-            target_records.append(temp)
-            column_metadata[d] = f"FY Ended {d.date()}"
-        latest_fy_date = annual_dates[0]
-    else:
-        print("⚠️ No annual 10-K data found.")
-        latest_fy_date = pd.Timestamp.min
-
-    df_ytd = df[(df['form'] == '10-Q') & (df['end'] > latest_fy_date)].copy()
-
-    if not df_ytd.empty:
-        latest_ytd_date = df_ytd['end'].max()
-        temp_ytd = df_ytd[df_ytd['end'] == latest_ytd_date]
-        max_ytd_duration = temp_ytd['duration_days'].max()
-        temp_ytd = temp_ytd[temp_ytd['duration_days'] == max_ytd_duration].drop_duplicates('tag', keep='last')
-        target_records.append(temp_ytd)
-
-        months = max(1, round(max_ytd_duration / 30))
-        column_metadata[latest_ytd_date] = f"Latest YTD ({months} Mos) Ended {latest_ytd_date.date()}"
-
-        prior_ytd_target = latest_ytd_date - pd.Timedelta(days=365)
-        df_prior_ytd = df[
-            (df['form'] == '10-Q') &
-            (df['end'].between(prior_ytd_target - pd.Timedelta(days=15), prior_ytd_target + pd.Timedelta(days=15))) &
-            (df['duration_days'].between(max_ytd_duration - 5, max_ytd_duration + 5))
-        ].copy()
-
-        if not df_prior_ytd.empty:
-            prior_ytd_date = df_prior_ytd['end'].max()
-            temp_prior_ytd = df_prior_ytd[df_prior_ytd['end'] == prior_ytd_date].drop_duplicates('tag', keep='last')
-            target_records.append(temp_prior_ytd)
-            column_metadata[prior_ytd_date] = f"Prior YTD ({months} Mos) Ended {prior_ytd_date.date()}"
-        else:
-            print("⚠️ Match for prior year's YTD quarter not found.")
-
-    if not target_records:
-        print(f"❌ Could not isolate requested periods for {ticker}.")
-        return None
-
-    final_df = pd.concat(target_records)
-    final_df['value_millions'] = (final_df['value'] / 1e6).round(2)
-
-    matrix = final_df.pivot_table(index='tag', columns='end', values='value_millions', aggfunc='last')
-    matrix.columns = [column_metadata[col] for col in matrix.columns]
-    matrix = matrix.fillna(0.00).sort_index()
-
-    print(f"\n========================================================")
-    print(f"📊 INCOME STATEMENT METRICS & INTEREST MATRIX: {ticker}")
-    print(f"========================================================")
-
-    return matrix
-
-# ==============================================================================
-# EXECUTION WORKFLOW
-# ==============================================================================
 if __name__ == "__main__":
-    # 1. Run CIK Loader
-    df_tickers = load_sec_ticker_directory()
-
-    if df_tickers is not None:
-        # Display directory top snippet
-        display(df_tickers.head())
-
-        # 2. Run Portfolio Auditing Matrix (Exposing calculation quarters)
-        portfolio = ["CLF"]
-        df_income_statement = extract_audited_sec_matrix(portfolio, df_tickers, target_years=[2024, 2025])
-        print("\n🎉 Performance Breakdown Table Complete!")
-        display(df_income_statement)
-
-        # 3. Run Lean Balance Sheet with Preferred Equity parameters Included
-        df_nucor_balance_sheet = get_lean_filtered_balance_sheet("CLF")
-        display(df_nucor_balance_sheet)
-
-        # 4. Run D&A Matrix
-        df_nucor_dna = get_dna_and_impairment_ltm_ready("CLF")
-        display(df_nucor_dna)
-
-        # 5. Run EBIT/EBT/Interest Matrix with Net Interest parameters loaded
-        df_nucor_earnings = get_earnings_and_interest_ltm_ready("CLF")
-        display(df_nucor_earnings)
+    main()
 
