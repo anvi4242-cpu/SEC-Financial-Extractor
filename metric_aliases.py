@@ -58,6 +58,21 @@ METRIC_ALIASES: dict[str, tuple[str, ...]] = {
         "TemporaryEquityCarryingAmountAttributableToParent",
         "PreferredStocksIncludingAdditionalPaidInCapital",
     ),
+    # Finance-lease liabilities are usually rolled into broader balance-sheet
+    # captions (Other current/long-term liabilities, or Short-/Long-term debt)
+    # and only segregated in the Leases note. XBRL exposes that segregated
+    # note-level amount directly, so these tags give the finance-lease
+    # component without pulling the whole parent caption. When a filer treats
+    # finance leases as immaterial the tag is simply absent, and the extractor
+    # records 0.0 with no tag/date rather than an assumed value.
+    "Finance Lease Short-Term": (
+        "FinanceLeaseLiabilityCurrent",
+        "CapitalLeaseObligationsCurrent",
+    ),
+    "Finance Lease Long-Term": (
+        "FinanceLeaseLiabilityNoncurrent",
+        "CapitalLeaseObligationsNoncurrent",
+    ),
     "D&A": (
         "DepreciationDepletionAndAmortization",
         "DepreciationAndAmortization",
@@ -85,5 +100,12 @@ LTM_METRICS = (
     "Impairment",
 )
 
-BALANCE_SHEET_METRICS = ("Cash", "Investments", "Debt", "Preferred Equity")
+BALANCE_SHEET_METRICS = (
+    "Cash",
+    "Investments",
+    "Debt",
+    "Preferred Equity",
+    "Finance Lease Short-Term",
+    "Finance Lease Long-Term",
+)
 

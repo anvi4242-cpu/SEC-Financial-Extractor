@@ -79,6 +79,8 @@ class PipelineTests(unittest.TestCase):
             "Investments",
             "Debt",
             "Preferred Equity",
+            "Finance Lease Short-Term",
+            "Finance Lease Long-Term",
             "D&A",
             "Impairment",
         }
@@ -148,6 +150,44 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual("2025-06-30", result.iloc[0]["As Of Date"])
         self.assertEqual(125.0, result.iloc[0]["Value ($ Millions)"])
+
+    def test_finance_lease_is_segregated_from_broader_captions(self):
+        facts = companyfacts(
+            extra_tags={
+                "FinanceLeaseLiabilityCurrent": {
+                    "units": {"USD": [instant_fact("2025-06-30", 150_000_000)]}
+                },
+                "FinanceLeaseLiabilityNoncurrent": {
+                    "units": {"USD": [instant_fact("2025-06-30", 900_000_000)]}
+                },
+            }
+        )
+
+        result = extract_balance_sheet_metrics(
+            facts,
+            "TEST",
+            "0000000001",
+            ["Finance Lease Short-Term", "Finance Lease Long-Term"],
+        )
+        by_metric = result.set_index("Metric")
+
+        self.assertEqual(150.0, by_metric.loc["Finance Lease Short-Term", "Value ($ Millions)"])
+        self.assertEqual(
+            "FinanceLeaseLiabilityCurrent",
+            by_metric.loc["Finance Lease Short-Term", "Original SEC Tag"],
+        )
+        self.assertEqual(900.0, by_metric.loc["Finance Lease Long-Term", "Value ($ Millions)"])
+
+    def test_finance_lease_absent_is_recorded_as_not_disclosed(self):
+        facts = companyfacts(extra_tags={})
+
+        result = extract_balance_sheet_metrics(
+            facts, "TEST", "0000000001", ["Finance Lease Short-Term"]
+        )
+
+        self.assertEqual(0.0, result.iloc[0]["Value ($ Millions)"])
+        self.assertIsNone(result.iloc[0]["Original SEC Tag"])
+        self.assertIsNone(result.iloc[0]["As Of Date"])
 
     def test_main_pipeline_is_ticker_driven_and_fetches_companyfacts_once(self):
         directory = {

@@ -46,12 +46,29 @@ The reusable `METRIC_ALIASES` dictionary in `metric_aliases.py` covers:
 - Investments
 - Debt
 - Preferred Equity
+- Finance Lease Short-Term
+- Finance Lease Long-Term
 - D&A
 - Impairment
 
 Aliases are ordered from the preferred US-GAAP tag to fallbacks. The extractor
 records balance-sheet tags individually to avoid silently double-counting debt
 or investment totals and components.
+
+### Finance leases
+
+Finance-lease liabilities are usually folded into broader balance-sheet
+captions (`Other current/long-term liabilities`, or `Short-/Long-term debt`)
+and only segregated in the Leases note. The `Finance Lease Short-Term` and
+`Finance Lease Long-Term` metrics read the note-level XBRL tags
+(`FinanceLeaseLiabilityCurrent` / `FinanceLeaseLiabilityNoncurrent`, with the
+pre-ASC 842 `CapitalLeaseObligations*` tags as fallbacks), so they capture the
+finance-lease component only — never the whole parent caption. Because `Debt`
+also has combined `LongTermDebtAndFinanceLeaseObligations*` tags in its alias
+list, exposing the pure finance-lease amounts lets you subtract them out and
+avoid double-counting (e.g. IBM, Boeing). When a filer treats finance leases as
+immaterial the tag is absent and the row is recorded as `0.0` with no tag or
+date — i.e. "not separately disclosed" rather than an assumed value.
 
 ## LTM calculation
 
